@@ -1,7 +1,9 @@
 use serde_::{Deserialize, Serialize};
 use std::{env, process};
 use std::sync::{Arc};
+use bytes::Bytes;
 use tokio_unix_ipc::{Bootstrapper, channel, Receiver, Sender};
+use crate::Location::Ip;
 
 const ENV_VAR: &str = "PROC_CONNECT_TO";
 
@@ -9,13 +11,46 @@ const ENV_VAR: &str = "PROC_CONNECT_TO";
 #[serde(crate = "serde_")]
 pub enum Task {
     Sum(Vec<i64>, Sender<i64>),
+    MultiGet(MultiGetRequest, Sender<MultiGetResponse>),
     Shutdown
+}
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "serde_")]
+pub enum Location {
+    Ip(String),
+    Fd(u32)
+}
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "serde_")]
+pub struct Client {
+    pub location: Option<Location>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "serde_")]
+pub struct MultiGetRequest {
+    pub client: Option<Client>,
+    pub object_ids: Vec<String>
+}
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "serde_")]
+pub struct MultiGetResponse {
+    pub client: Option<Client>,
+    pub object_ids: Vec<String>
+}
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "serde_")]
+pub struct KvMetaResponse {
+    pub object_id: String,
+    /// 状态码；
+    pub status: u32,
+    pub message: String,
 }
 
 #[async_trait::async_trait]
 pub trait TaskService {
     async fn sum(&self, vec: Vec<i64>) -> i64;
     async fn shutdown(&self);
+    async fn multi_get(&self, req: MultiGetRequest) -> MultiGetResponse;
 }
 
 #[tokio::main]
@@ -32,6 +67,13 @@ async fn main() {
 
         let sum = client.sum(vec![1, 2, 3]).await;
         println!("sum = {}", sum);
+
+        let req = MultiGetRequest {
+            client: None,
+            object_ids: vec![]
+        };
+        let resp = client.multi_get(req).await;
+        println!("resp = {:?}", resp);
 
         child.kill().ok();
         child.wait().ok();
@@ -62,6 +104,10 @@ impl IpcReceiver {
                     self.shutdown().await;
                     break
                 }
+                Task::MultiGet(req, tx) => {
+                    let resp = self.multi_get(req).await;
+                    tx.send(resp).await.unwrap();
+                }
             }
         }
     }
@@ -73,6 +119,16 @@ impl TaskService for IpcReceiver {
     }
 
     async fn shutdown(&self) {
+    }
+
+    async fn multi_get(&self, req: MultiGetRequest) -> MultiGetResponse {
+        let client = Client {
+            location: Some(Ip("192.168.1.1".parse().unwrap()))
+        };
+        MultiGetResponse {
+            client: Some(client),
+            object_ids: vec!["1".to_string(), "2".to_string()]
+        }
     }
 }
 
@@ -101,5 +157,11 @@ impl TaskService for IpcSender {
 
     async fn shutdown(&self) {
         self.bootstrap.send(Task::Shutdown).await.unwrap()
+    }
+
+    async fn multi_get(&self, req: MultiGetRequest) -> MultiGetResponse {
+        let (tx, rx) = channel().unwrap();
+        self.bootstrap.send(Task::MultiGet(req, tx)).await.unwrap();
+        rx.recv().await.unwrap()
     }
 }
